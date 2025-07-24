@@ -34,7 +34,6 @@ public:
     void broadcast_to_peers(const std::vector<char>& data);
     void set_on_client_message(ClientMessageHandler handler);
     void set_on_peer_message(PeerMessageHandler handler);
-    ReplicaManager* get_replica_manager();
 
 
 private:
