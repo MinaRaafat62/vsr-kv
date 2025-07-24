@@ -6,53 +6,53 @@
 #include <string>
 #include <vector>
 #include <map>
+#include <netinet/in.h>
 
-// Forward declarations
 class IoUringLoop;
 class TcpConnection;
+class ReplicaManager;
 
-// User-defined handlers for server events
 using ConnectionHandler = std::function<void(std::shared_ptr<TcpConnection>)>;
-using MessageHandler = std::function<void(std::shared_ptr<TcpConnection>, const std::vector<char>& data)>;
+using ClientMessageHandler = std::function<void(std::shared_ptr<TcpConnection>, const std::vector<char>& data)>;
+using PeerMessageHandler = std::function<void(std::shared_ptr<TcpConnection>, const std::vector<char>& data)>;
+
 
 class TcpServer {
 public:
     TcpServer(IoUringLoop& loop, int port);
     ~TcpServer();
 
-    // Disable copy and move
     TcpServer(const TcpServer&) = delete;
     TcpServer& operator=(const TcpServer&) = delete;
 
-    // Start the server (begins listening and accepting)
     void start();
-    
-    // Set the user-defined handlers
     void set_on_connect(ConnectionHandler handler);
-    void set_on_message(MessageHandler handler);
     void set_on_disconnect(ConnectionHandler handler);
-
-    // Send data to a specific connection
     void send(std::shared_ptr<TcpConnection> connection, const std::vector<char>& data);
+    void set_replica_manager(std::unique_ptr<ReplicaManager> manager);
+    void register_new_connection(std::shared_ptr<TcpConnection> connection);
+    void broadcast_to_peers(const std::vector<char>& data);
+    void set_on_client_message(ClientMessageHandler handler);
+    void set_on_peer_message(PeerMessageHandler handler);
+    ReplicaManager* get_replica_manager();
+
 
 private:
     void setup_listening_socket();
     void start_accept();
-    void handle_new_connection(int client_socket);
+    void handle_new_connection(int client_socket, const sockaddr_in& client_address);
     void start_reading(std::shared_ptr<TcpConnection> connection);
     void remove_connection(const std::shared_ptr<TcpConnection>& connection);
 
     IoUringLoop& loop_;
     int port_;
     int server_socket_;
-
-    // Default handlers
     ConnectionHandler on_connect_ = [](auto){};
-    MessageHandler on_message_ = [](auto, const auto&){};
     ConnectionHandler on_disconnect_ = [](auto){};
-
-    // Keep track of active connections
     std::map<int, std::shared_ptr<TcpConnection>> connections_;
+    std::unique_ptr<ReplicaManager> replica_manager_;
+    ClientMessageHandler on_client_message_ = [](auto, const auto&){};
+    PeerMessageHandler on_peer_message_ = [](auto, const auto&){};
 };
 
 #endif // TCP_SERVER_HPP

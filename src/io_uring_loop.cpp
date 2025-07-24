@@ -1,9 +1,8 @@
 #include "io_uring_loop.hpp"
-#include "tcp_connection.hpp" // Now we need the full definition
+#include "tcp_connection.hpp"
 #include <iostream>
 #include <stdexcept>
 #include <cstring>
-#include <netinet/in.h>
 
 IoUringLoop::IoUringLoop(unsigned int queue_depth) {
     if (io_uring_queue_init(queue_depth, &ring_, 0) < 0) {
@@ -25,13 +24,17 @@ void IoUringLoop::run() {
 
         io_uring_for_each_cqe(&ring_, head, cqe) {
             count++;
-            // Reconstitute the unique_ptr from the raw pointer to manage its lifetime.
-            // When this unique_ptr goes out of scope, the IORequest is automatically deleted.
             std::unique_ptr<IORequest> request(static_cast<IORequest*>(io_uring_cqe_get_data(cqe)));
             
-            if (request && request->on_complete) {
-                // Execute the callback with the result of the operation.
-                request->on_complete(cqe->res);
+            if (request) {
+                std::visit([&](auto&& cb) {
+                    using T = std::decay_t<decltype(cb)>;
+                    if constexpr (std::is_same_v<T, AcceptCallback>) {
+                        cb(cqe->res, request->remote_address);
+                    } else if constexpr (std::is_same_v<T, IoCallback>) {
+                        cb(cqe->res);
+                    }
+                }, request->callback);
             }
         }
 
@@ -41,16 +44,15 @@ void IoUringLoop::run() {
     }
 }
 
-void IoUringLoop::submit_accept(int server_socket, IoCallback callback) {
+void IoUringLoop::submit_accept(int server_socket, AcceptCallback callback) {
     io_uring_sqe* sqe = io_uring_get_sqe(&ring_);
-    if (!sqe) return; // Queue is full
+    if (!sqe) return;
 
-    // Ownership of the request is passed to io_uring via the raw pointer.
-    // We get it back in the run loop to manage its destruction.
     auto request = std::make_unique<IORequest>();
-    request->on_complete = std::move(callback);
+    request->callback = std::move(callback);
 
-    io_uring_prep_accept(sqe, server_socket, nullptr, nullptr, 0);
+    socklen_t client_len = sizeof(request->remote_address);
+    io_uring_prep_accept(sqe, server_socket, reinterpret_cast<sockaddr*>(&request->remote_address), &client_len, 0);
     io_uring_sqe_set_data(sqe, request.release());
 }
 
@@ -59,10 +61,8 @@ void IoUringLoop::submit_read(std::shared_ptr<TcpConnection> connection, size_t 
     if (!sqe) return;
 
     auto request = std::make_unique<IORequest>();
-    request->on_complete = std::move(callback);
-    request->connection = connection; // Hold a shared_ptr to keep the connection alive
-    
-    // Ensure buffer in connection is large enough
+    request->callback = std::move(callback);
+    request->connection = connection;
     connection->get_buffer().resize(size);
 
     io_uring_prep_read(sqe, connection->get_socket(), connection->get_buffer().data(), size, 0);
@@ -74,10 +74,35 @@ void IoUringLoop::submit_write(std::shared_ptr<TcpConnection> connection, const 
     if (!sqe) return;
 
     auto request = std::make_unique<IORequest>();
-    request->on_complete = std::move(callback);
+    request->callback = std::move(callback);
     request->connection = connection;
-    request->write_buffer = buffer; // Copy the data to be written
+    request->write_buffer = buffer;
 
     io_uring_prep_write(sqe, connection->get_socket(), request->write_buffer.data(), request->write_buffer.size(), 0);
+    io_uring_sqe_set_data(sqe, request.release());
+}
+
+void IoUringLoop::submit_connect(int socket, const sockaddr_in& address, IoCallback callback) {
+    io_uring_sqe* sqe = io_uring_get_sqe(&ring_);
+    if (!sqe) return;
+
+    auto request = std::make_unique<IORequest>();
+    request->callback = std::move(callback);
+    request->remote_address = address;
+
+    io_uring_prep_connect(sqe, socket, reinterpret_cast<const sockaddr*>(&request->remote_address), sizeof(request->remote_address));
+    io_uring_sqe_set_data(sqe, request.release());
+}
+
+void IoUringLoop::submit_timeout(std::chrono::nanoseconds duration, IoCallback callback) {
+    io_uring_sqe* sqe = io_uring_get_sqe(&ring_);
+    if (!sqe) return;
+
+    auto request = std::make_unique<IORequest>();
+    request->callback = std::move(callback);
+    request->timeout_spec.tv_sec = std::chrono::duration_cast<std::chrono::seconds>(duration).count();
+    request->timeout_spec.tv_nsec = (duration % std::chrono::seconds(1)).count();
+
+    io_uring_prep_timeout(sqe, &request->timeout_spec, 0, 0);
     io_uring_sqe_set_data(sqe, request.release());
 }

@@ -2,12 +2,9 @@
 #include <unistd.h>
 #include <iostream>
 
-TcpConnection::TcpConnection(int socket) : socket_fd_(socket), buffer_(1024) {
-    std::cout << "Connection created for socket: " << socket_fd_ << std::endl;
-}
+TcpConnection::TcpConnection(int socket) : socket_fd_(socket), buffer_(1024) {}
 
 TcpConnection::~TcpConnection() {
-    std::cout << "Connection for socket " << socket_fd_ << " destroyed." << std::endl;
     close_socket();
 }
 
@@ -21,7 +18,11 @@ std::vector<char>& TcpConnection::get_buffer() {
 
 void TcpConnection::close_socket() {
     if (socket_fd_ != -1) {
+        std::cout << "Closing socket " << socket_fd_ << std::endl;
         close(socket_fd_);
         socket_fd_ = -1;
     }
 }
+
+TcpConnection::State TcpConnection::get_state() const { return state_; }
+void TcpConnection::set_state(State new_state) { state_ = new_state; }
