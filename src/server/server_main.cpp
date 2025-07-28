@@ -58,14 +58,18 @@ int main(int argc, char *argv[])
             {
                 std::cout << "[Replica " << self_id << "] Received from CLIENT: " 
                           << "Command=" << static_cast<int>(msg.header.command_) 
-                          << ", Op=" << msg.header.op << std::endl;
+                          << ", Op=" << msg.header.op 
+                          << ", operation=" <<  static_cast<int>(msg.header.operation_)
+                          << std::endl;
                 
             }
             else if (conn->get_state() == TcpConnection::State::PEER)
             {
                 std::cout << "[Replica " << self_id << "] Received from PEER: " 
                           << "Command=" << static_cast<int>(msg.header.command_)
-                          << ", Op=" << msg.header.op << std::endl;
+                          << ", Op=" << msg.header.op 
+                          << ", operation=" <<  static_cast<int>(msg.header.operation_)
+                          << std::endl;
                 
             }
         });

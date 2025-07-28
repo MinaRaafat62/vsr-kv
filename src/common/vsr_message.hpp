@@ -54,6 +54,7 @@ struct [[gnu::packed]] vsr_header {
 
 class vsr_message {
 public:
+    vsr_message() : header{} {}
     vsr_header header;
     std::vector<byte> payload;
 
