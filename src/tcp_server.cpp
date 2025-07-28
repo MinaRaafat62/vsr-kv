@@ -79,38 +79,25 @@ void TcpServer::start_reading(std::shared_ptr<TcpConnection> connection) {
     loop_.submit_read(connection, connection->get_buffer().size(), [this, conn = connection](int result) {
         if (result > 0) {
             std::vector<char> received_data(conn->get_buffer().begin(), conn->get_buffer().begin() + result);
-            std::string message(received_data.begin(), received_data.end());
 
-            // Check the connection's current state
-            switch (conn->get_state()) {
-                case TcpConnection::State::UNIDENTIFIED: {
-                    // This is the first message. Is it a handshake?
-                    if (message.rfind("HANDSHAKE_ID:", 0) == 0) {
-                        int peer_id = std::stoi(message.substr(13));
-                        conn->set_state(TcpConnection::State::PEER);
-                        if (replica_manager_) {
-                            replica_manager_->register_identified_peer(peer_id, conn);
-                        }
-                        on_connect_(conn); // Now we can call the connection handler
-                    } else {
-                        // Not a handshake, so it must be a client.
-                        conn->set_state(TcpConnection::State::CLIENT);
-                        on_connect_(conn);
-                        on_client_message_(conn, received_data);
+            if (conn->get_state() == TcpConnection::State::UNIDENTIFIED) {
+                // This is the first message. Check for our simple text-based handshake.
+                std::string message(received_data.begin(), received_data.end());
+                if (message.rfind("HANDSHAKE_ID:", 0) == 0) {
+                    int peer_id = std::stoi(message.substr(13));
+                    conn->set_state(TcpConnection::State::PEER);
+                    if (replica_manager_) {
+                        replica_manager_->register_identified_peer(peer_id, conn);
                     }
-                    break;
+                    on_connect_(conn);
+                } else {
+                    conn->set_state(TcpConnection::State::CLIENT);
+                    on_connect_(conn);
+                    on_message_(conn, received_data); // Pass the first message up.
                 }
-                case TcpConnection::State::PEER: {
-                    on_peer_message_(conn, received_data);
-                    break;
-                }
-                case TcpConnection::State::CLIENT: {
-                    on_client_message_(conn, received_data);
-                    break;
-                }
+            } else {
+                on_message_(conn, received_data);
             }
-            
-            // Queue up the next read for this connection
             start_reading(conn);
         } else {
             on_disconnect_(conn);
@@ -128,13 +115,12 @@ void TcpServer::remove_connection(const std::shared_ptr<TcpConnection>& connecti
     }
 }
 
-
 void TcpServer::broadcast_to_peers(const std::vector<char>& data) {
     if (replica_manager_) {
         replica_manager_->broadcast_to_peers(data);
     }
 }
 
-void TcpServer::set_on_client_message(ClientMessageHandler handler) { on_client_message_ = std::move(handler); }
-void TcpServer::set_on_peer_message(PeerMessageHandler handler) { on_peer_message_ = std::move(handler); }
-
+void TcpServer::set_on_message(MessageHandler handler) { 
+    on_message_ = std::move(handler); 
+}

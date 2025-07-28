@@ -13,9 +13,7 @@ class TcpConnection;
 class ReplicaManager;
 
 using ConnectionHandler = std::function<void(std::shared_ptr<TcpConnection>)>;
-using ClientMessageHandler = std::function<void(std::shared_ptr<TcpConnection>, const std::vector<char>& data)>;
-using PeerMessageHandler = std::function<void(std::shared_ptr<TcpConnection>, const std::vector<char>& data)>;
-
+using MessageHandler = std::function<void(std::shared_ptr<TcpConnection>, const std::vector<char>& data)>;
 
 class TcpServer {
 public:
@@ -32,9 +30,7 @@ public:
     void set_replica_manager(std::unique_ptr<ReplicaManager> manager);
     void register_new_connection(std::shared_ptr<TcpConnection> connection);
     void broadcast_to_peers(const std::vector<char>& data);
-    void set_on_client_message(ClientMessageHandler handler);
-    void set_on_peer_message(PeerMessageHandler handler);
-
+    void set_on_message(MessageHandler handler);
 
 private:
     void setup_listening_socket();
@@ -50,8 +46,7 @@ private:
     ConnectionHandler on_disconnect_ = [](auto){};
     std::map<int, std::shared_ptr<TcpConnection>> connections_;
     std::unique_ptr<ReplicaManager> replica_manager_;
-    ClientMessageHandler on_client_message_ = [](auto, const auto&){};
-    PeerMessageHandler on_peer_message_ = [](auto, const auto&){};
+    MessageHandler on_message_ = [](auto, const auto&){};
 };
 
 #endif // TCP_SERVER_HPP

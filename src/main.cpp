@@ -1,7 +1,9 @@
 #include "io_uring_loop.hpp"
 #include "tcp_server.hpp"
-#include "tcp_connection.hpp"
 #include "replica_manager.hpp"
+#include "protocol_handler.hpp"
+#include "vsr_message.hpp"
+#include "tcp_connection.hpp"
 #include <iostream>
 #include <vector>
 #include <string>
@@ -44,21 +46,28 @@ int main(int argc, char *argv[])
         IoUringLoop loop;
         TcpServer server(loop, self_port);
         auto manager = std::make_unique<ReplicaManager>(loop, server, self_id, std::move(peers_to_connect));
+        
+        // Create the protocol handler, which links itself to the server.
+        protocol_handler handler(server);
 
-        server.set_on_client_message([&server, self_id](std::shared_ptr<TcpConnection> conn, const std::vector<char> &data)
+        // The application layer now sets a single callback on the protocol_handler.
+        handler.set_on_message_received([&handler, self_id](std::shared_ptr<TcpConnection> conn, vsr_message& msg)
         {
-        std::string message(data.begin(), data.end());
-        std::cout << "[Replica " << self_id << "] Received message from CLIENT: '" << message << "'" << std::endl;
-        std::cout << "[Replica " << self_id << "] Broadcasting client message to peers..." << std::endl;
-        server.broadcast_to_peers(data); 
-        });
-
-        // This handler is for messages from other REPLICAS
-        server.set_on_peer_message([self_id](std::shared_ptr<TcpConnection> conn, const std::vector<char> &data)
-        {
-            std::string message(data.begin(), data.end());
-            std::cout << "[Replica " << self_id << "] Received message from PEER: '" << message << "'" << std::endl;
-
+            // The application can now inspect the connection state to decide what to do.
+            if (conn->get_state() == TcpConnection::State::CLIENT)
+            {
+                std::cout << "[Replica " << self_id << "] Received from CLIENT: " 
+                          << "Command=" << static_cast<int>(msg.header.command_) 
+                          << ", Op=" << msg.header.op << std::endl;
+                
+            }
+            else if (conn->get_state() == TcpConnection::State::PEER)
+            {
+                std::cout << "[Replica " << self_id << "] Received from PEER: " 
+                          << "Command=" << static_cast<int>(msg.header.command_)
+                          << ", Op=" << msg.header.op << std::endl;
+                
+            }
         });
 
         server.set_replica_manager(std::move(manager));
