@@ -1,17 +1,68 @@
 #include "vsr_message.hpp"
+#include "checksum.hpp"
 #include <cstring> 
 #include <vector>
 #include <iostream>
 
-// This is the implementation for the serialize function. It remains unchanged.
-std::vector<byte> vsr_message::serialize() const {
-    vsr_header header_to_serialize = header;
-    header_to_serialize.size = sizeof(vsr_header) + payload.size();
-    std::vector<byte> buffer(header_to_serialize.size);
-    std::memcpy(buffer.data(), &header_to_serialize, sizeof(vsr_header));
-    if (!payload.empty()) {
-        std::memcpy(buffer.data() + sizeof(vsr_header), payload.data(), payload.size());
+void vsr_message::calculate_and_set_body_checksum()
+{
+    if (payload.empty()){
+        header.checksum_body = {0,0};
+    } else {
+        header.checksum_body = checksum::calculate_checksum_128(payload);
     }
+}
+
+void vsr_message::calculate_and_set_header_checksum(){
+    header.checksum = {0,0};
+    std::span<const byte> header_bytes(
+        reinterpret_cast<const byte*>(&header), 
+        sizeof(vsr_header)
+    );
+    header.checksum  = checksum::calculate_checksum_128(header_bytes);
+}
+
+bool vsr_message::verify_body_checksum() const {
+    if (payload.empty()) {
+        return header.checksum_body.high == 0 && header.checksum_body.low == 0;
+    }
+    auto calculated_checksum = checksum::calculate_checksum_128(payload);
+    return calculated_checksum == header.checksum_body;
+}
+
+
+bool vsr_message::verify_header_checksum() const {
+    vsr_header header_copy = header;
+    header_copy.checksum = {0, 0};
+
+    std::span<const byte> header_bytes(
+        reinterpret_cast<const byte*>(&header_copy), 
+        sizeof(vsr_header)
+    );
+
+    auto calculated_checksum = checksum::calculate_checksum_128(header_bytes);
+    return calculated_checksum == header.checksum;
+}
+
+
+std::vector<byte> vsr_message::serialize() const {
+    // Create a mutable copy to work with.
+    vsr_message msg_to_serialize = *this;
+
+    //  Set all payload-dependent fields in the header first, including the size.
+    msg_to_serialize.calculate_and_set_body_checksum();
+    msg_to_serialize.header.size = sizeof(vsr_header) + msg_to_serialize.payload.size();
+
+    // Now that all other header fields are final, calculate the header checksum.
+    msg_to_serialize.calculate_and_set_header_checksum();
+
+    // Serialize the prepared message.
+    std::vector<byte> buffer(msg_to_serialize.header.size);
+    std::memcpy(buffer.data(), &msg_to_serialize.header, sizeof(vsr_header));
+    if (!msg_to_serialize.payload.empty()) {
+        std::memcpy(buffer.data() + sizeof(vsr_header), msg_to_serialize.payload.data(), msg_to_serialize.payload.size());
+    }
+
     return buffer;
 }
 
@@ -26,39 +77,33 @@ bool vsr_message::deserialize(const std::vector<char>& data, vsr_message& msg) {
 }
 
 bool vsr_message::deserialize(const std::vector<byte>& data, vsr_message& msg) {
-    // A valid message must at least contain a full header.
+    // Basic size validation
     if (data.size() < sizeof(vsr_header)) {
-        std::cerr << "Deserialization error: data size (" << data.size() 
-                  << ") is smaller than header size (" << sizeof(vsr_header) << ")." << std::endl;
+        std::cerr << "Deserialization error: data size is smaller than header." << std::endl;
         return false;
     }
 
-    // Copy the header data from the buffer into the vsr_header struct.
+    // Copy data into the message struct
     std::memcpy(&msg.header, data.data(), sizeof(vsr_header));
-
-    // Validate the total size specified in the header.
-    if (data.size() != msg.header.size) {
-        std::cerr << "Deserialization error: data size (" << data.size() 
-                  << ") does not match size in header (" << msg.header.size << ")." << std::endl;
+    if (msg.header.size != data.size()) {
+        std::cerr << "Deserialization error: size in header does not match data size." << std::endl;
         return false;
     }
-
-    // The size in the header cannot be smaller than the header itself.
-    if (msg.header.size < sizeof(vsr_header)) {
-        std::cerr << "Deserialization error: size in header (" << msg.header.size
-                  << ") is smaller than the header itself (" << sizeof(vsr_header) << ")." << std::endl;
-        return false;
-    }
-    
-    // Calculate the payload size.
     size_t payload_size = msg.header.size - sizeof(vsr_header);
-
     if (payload_size > 0) {
-        // Copy the payload from the buffer.
         msg.payload.assign(data.begin() + sizeof(vsr_header), data.end());
-    } else {
-        msg.payload.clear();
     }
 
+    //  Automatically verify checksums. If they fail, deserialization fails.
+    if (!msg.verify_header_checksum()) {
+        std::cerr << "Deserialization error: Header checksum verification failed." << std::endl;
+        return false;
+    }
+    if (!msg.verify_body_checksum()) {
+        std::cerr << "Deserialization error: Body checksum verification failed." << std::endl;
+        return false;
+    }
+
+    // Only if all checks pass, we return true.
     return true;
 }

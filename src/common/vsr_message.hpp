@@ -58,10 +58,16 @@ public:
     vsr_header header;
     std::vector<byte> payload;
 
-    std::vector<byte> serialize() const;
 
+    std::vector<byte> serialize() const;
     static bool deserialize(const std::vector<byte>& data, vsr_message& msg);
     static bool deserialize(const std::vector<char>& data, vsr_message& msg);
+
+private:
+    void calculate_and_set_body_checksum();
+    void calculate_and_set_header_checksum();
+    bool verify_body_checksum() const;
+    bool verify_header_checksum() const;
 
 };
 

@@ -1,32 +1,43 @@
 cmake_minimum_required(VERSION 3.22)
-project(ModernTCPServer CXX)
+project(VsrProject CXX C)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+include(FetchContent)
+FetchContent_Declare(
+    blake3_proj
+    GIT_REPOSITORY https://github.com/BLAKE3-team/BLAKE3.git
+    GIT_TAG        1.8.2
+)
+
+FetchContent_GetProperties(blake3_proj)
+if(NOT blake3_proj_POPULATED)
+    FetchContent_Populate(blake3_proj)
+    add_subdirectory(${blake3_proj_SOURCE_DIR}/c ${blake3_proj_BINARY_DIR})
+endif()
+
+
+add_library(B3::blake3 ALIAS blake3)
+
 
 #=============================================================================
 # 1. DEFINE A STATIC LIBRARY FOR SHARED CODE
-# This library will contain all the common networking and protocol logic.
-# It gets compiled once and then linked into both the server and the client.
 #=============================================================================
 add_library(vsr_common STATIC
     src/common/io_uring_loop.cpp
     src/common/tcp_client.cpp
     src/common/tcp_connection.cpp
     src/common/vsr_message.cpp
+    src/common/checksum.cpp
 )
 
-
-# Make the headers in src/common available to any target that links vsr_common.
-# The 'PUBLIC' keyword is crucial here.
 target_include_directories(vsr_common PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/src/common
 )
 
-# The common library itself needs the uring library.
-target_link_libraries(vsr_common PUBLIC uring)
+target_link_libraries(vsr_common PUBLIC uring B3::blake3)
 
 
 #=============================================================================
@@ -39,15 +50,11 @@ add_executable(server
     src/server/protocol_handler.cpp
 )
 
-# Make the headers in src/server available to the server executable.
 target_include_directories(server PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src/server
 )
 
-# Link the server against our common library. This automatically gives it
-# access to all the public headers and libraries from vsr_common.
 target_link_libraries(server PRIVATE vsr_common)
-
 
 
 #=============================================================================
@@ -57,5 +64,4 @@ add_executable(client
     src/client/client_main.cpp
 )
 
-# Link the client against our common library.
 target_link_libraries(client PRIVATE vsr_common)
