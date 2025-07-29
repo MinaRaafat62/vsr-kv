@@ -4,6 +4,7 @@
 #include "vsr_message.hpp"
 #include <functional>
 #include <memory>
+#include <map>
 
 class TcpConnection;
 class TcpServer;
@@ -11,10 +12,10 @@ class TcpServer;
 // Callback for the application layer, providing a fully parsed message.
 using VsrMessageHandler = std::function<void(std::shared_ptr<TcpConnection>, vsr_message&)>;
 
-class protocol_handler {
+class ProtocolHandler {
 public:
     // The handler hooks into the server upon construction.
-    explicit protocol_handler(TcpServer& server);
+    explicit ProtocolHandler(TcpServer& server);
 
     // The application layer sets this callback to process incoming messages.
     void set_on_message_received(VsrMessageHandler handler);
@@ -28,9 +29,11 @@ public:
 private:
     // This is the function that gets registered with the TcpServer.
     void handle_raw_data(std::shared_ptr<TcpConnection> connection, const std::vector<char>& data);
+    void on_disconnect(std::shared_ptr<TcpConnection> connection);
 
     TcpServer& server_;
     VsrMessageHandler on_message_received_ = [](auto, auto&){};
+    std::map<int, std::vector<char>> connection_buffers_;
 };
 
 #endif // PROTOCOL_HANDLER_HPP

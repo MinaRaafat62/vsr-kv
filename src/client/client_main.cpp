@@ -9,6 +9,11 @@
 #include <sstream>
 #include <mutex>
 #include <atomic>
+#include <memory>
+#include <chrono>
+#include <cstring>
+
+// --- Configuration ---
 
 struct ReplicaInfo {
     int id;
@@ -16,18 +21,35 @@ struct ReplicaInfo {
     int port;
 };
 
-// --- Shared State ---
+const std::vector<ReplicaInfo> CLUSTER_CONFIG = {
+    {0, "localhost", 8080},
+    {1, "localhost", 8081},
+    {2, "localhost", 8082}
+};
+
+const std::chrono::seconds RECONNECT_DELAY = std::chrono::seconds(5);
+
+// --- Shared State & Mutexes ---
+
+// Holds the TCP client objects, mapped by replica ID.
 std::map<int, std::shared_ptr<TcpClient>> clients;
-std::atomic<int> current_target_replica_id = 0; // Start by targeting replica 0
 std::mutex clients_mutex;
+
+// Buffers for handling TCP stream data, mapped by replica ID.
+std::map<int, std::vector<char>> client_side_buffers;
+std::mutex buffer_mutex;
+
+// For preventing garbled output from multiple threads.
 std::mutex cout_mutex;
+
+// The replica we are currently sending requests to.
+std::atomic<int> current_target_replica_id = 0;
 
 // --- Helper Functions ---
 
 void print_help() {
     std::lock_guard<std::mutex> lock(cout_mutex);
     std::cout << "\nAvailable commands:\n"
-              << "  connect          - Attempt to connect to all known replicas.\n"
               << "  status           - Show connection status and current target.\n"
               << "  ping             - Send a ping to the current target replica.\n"
               << "  get <key>        - Request a key from the current target.\n"
@@ -36,29 +58,47 @@ void print_help() {
               << "  exit / quit      - Close the client.\n" << std::endl;
 }
 
+// Schedules a reconnect attempt on the network thread after a delay.
+void schedule_reconnect(IoUringLoop& loop, std::shared_ptr<TcpClient> client, int replica_id) {
+    std::lock_guard<std::mutex> lock(cout_mutex);
+    std::cout << "\n[SYSTEM] Scheduling reconnect for Replica " << replica_id << " in " << RECONNECT_DELAY.count() << " seconds." << std::endl;
+    std::cout << "> " << std::flush;
+
+    // Post a task to the network loop to set a timeout.
+    loop.post([&loop, client, replica_id]() {
+        loop.submit_timeout(RECONNECT_DELAY, [client, replica_id](int result) {
+            {
+                std::lock_guard<std::mutex> lock(cout_mutex);
+                std::cout << "\n[SYSTEM] Attempting to reconnect to Replica " << replica_id << "..." << std::endl;
+                std::cout << "> " << std::flush;
+            }
+            client->connect();
+        });
+    });
+}
+
 // Advances the target to the next replica in a round-robin fashion.
-void advance_to_next_replica(int total_replicas) {
-    std::lock_guard<std::mutex> lock(clients_mutex);
+void advance_to_next_replica() {
     int old_target = current_target_replica_id.load();
-    int new_target = (old_target + 1) % total_replicas;
+    int new_target = (old_target + 1) % CLUSTER_CONFIG.size();
     current_target_replica_id.store(new_target);
     
     std::lock_guard<std::mutex> cout_lock(cout_mutex);
-    std::cout << "\n[FAILOVER] Target " << old_target << " is down. Advancing to target replica " << new_target << "." << std::endl;
+    std::cout << "\n[FAILOVER] Connection to target " << old_target << " is down. Advancing to replica " << new_target << "." << std::endl;
     std::cout << "> " << std::flush;
 }
 
-// Sends a message to the CURRENT target replica, handling failover.
-void send_message(const vsr_message& msg, int total_replicas) {
+// Sends a message to the current target, handling failover if disconnected.
+void send_message_to_target(const vsr_message& msg) {
     std::shared_ptr<TcpClient> client_to_use;
     int target_id = current_target_replica_id.load();
+    bool needs_failover = false;
 
     {
         std::lock_guard<std::mutex> lock(clients_mutex);
         auto it = clients.find(target_id);
         if (it == clients.end() || !it->second->is_connected()) {
-            // The target is already known to be disconnected, advance immediately.
-            // We call the advance function outside the lock to avoid recursive locking.
+            needs_failover = true;
         } else {
             client_to_use = it->second;
         }
@@ -68,32 +108,111 @@ void send_message(const vsr_message& msg, int total_replicas) {
         auto serialized_msg = msg.serialize();
         std::vector<char> char_vec(serialized_msg.begin(), serialized_msg.end());
         client_to_use->send(char_vec);
-    } else {
-        // If we couldn't get a client, it means it's disconnected.
-        advance_to_next_replica(total_replicas);
+    } else if (needs_failover) {
+        advance_to_next_replica();
     }
 }
 
-// --- Main Application ---
 
 int main() {
-    const std::vector<ReplicaInfo> cluster_config = {
-        {0, "localhost", 8080},
-        {1, "localhost", 8081},
-        {2, "localhost", 8082}
-    };
-    const int total_replicas = cluster_config.size();
-
     IoUringLoop loop;
     std::thread network_thread([&loop]() {
-        try { loop.run(); } catch (const std::exception& e) {
+        try {
+            loop.run();
+        } catch (const std::exception& e) {
             std::lock_guard<std::mutex> lock(cout_mutex);
             std::cerr << "Critical network loop error: " << e.what() << std::endl;
         }
     });
 
+    std::cout << "[SYSTEM] Client starting. Automatically connecting to all replicas..." << std::endl;
+
+    // --- Automatic Connection Setup ---
+    for (const auto& replica_info : CLUSTER_CONFIG) {
+        auto client = std::make_shared<TcpClient>(loop, replica_info.host, replica_info.port);
+        int replica_id = replica_info.id;
+
+        {
+            std::lock_guard<std::mutex> lock(clients_mutex);
+            clients[replica_id] = client;
+        }
+
+        client->set_on_connect([replica_id](auto conn) {
+            std::lock_guard<std::mutex> lock(cout_mutex);
+            std::cout << "\n[INFO] Successfully connected to Replica " << replica_id << "." << std::endl;
+            std::cout << "> " << std::flush;
+        });
+
+        auto on_failure = [&loop, client, replica_id](auto conn) {
+            {
+                std::lock_guard<std::mutex> lock(cout_mutex);
+                std::cout << "\n[INFO] Disconnected from Replica " << replica_id << "." << std::endl;
+            }
+             {
+                std::lock_guard<std::mutex> lock(buffer_mutex);
+                client_side_buffers.erase(replica_id);
+            }
+            if (current_target_replica_id.load() == replica_id) {
+                advance_to_next_replica();
+            }
+            schedule_reconnect(loop, client, replica_id);
+        };
+        
+        client->set_on_disconnect(on_failure);
+        client->set_on_connect_failed([&loop, client, replica_id]() {
+             {
+                std::lock_guard<std::mutex> lock(cout_mutex);
+                std::cout << "\n[INFO] Failed to connect to Replica " << replica_id << "." << std::endl;
+            }
+            schedule_reconnect(loop, client, replica_id);
+        });
+
+        client->set_on_message([replica_id](const std::vector<char>& data) {
+            std::lock_guard<std::mutex> lock(buffer_mutex);
+            auto& buffer = client_side_buffers[replica_id];
+            buffer.insert(buffer.end(), data.begin(), data.end());
+
+            while (true) {
+                if (buffer.size() < sizeof(vsr_header)) break;
+
+                vsr_header header;
+                std::memcpy(&header, buffer.data(), sizeof(vsr_header));
+                if (header.size == 0 || header.size > 65536) {
+                    buffer.clear();
+                    break;
+                }
+
+                if (buffer.size() < header.size) break;
+                
+                std::vector<char> full_message(buffer.begin(), buffer.begin() + header.size);
+                buffer.erase(buffer.begin(), buffer.begin() + header.size);
+
+                vsr_message msg;
+                {
+                    std::lock_guard<std::mutex> cout_lock(cout_mutex);
+                    std::cout << "\n[RECV from Replica " << replica_id << "] ";
+                    if (vsr_message::deserialize(full_message, msg)) {
+                        std::cout << "Cmd: " << static_cast<int>(msg.header.command_)
+                                  << ", Op: " << msg.header.op;
+                        if (!msg.payload.empty()) {
+                            std::string p(msg.payload.begin(), msg.payload.end());
+                            std::cout << ", Payload: '" << p << "'";
+                        }
+                    } else {
+                        std::cout << "Deserialization Error!";
+                    }
+                    std::cout << std::endl << "> " << std::flush;
+                }
+            }
+        });
+        
+        // Initial connection attempt
+        client->connect();
+    }
+
     print_help();
 
+    // --- User Command Loop ---
     std::string line;
     while (true) {
         {
@@ -102,6 +221,7 @@ int main() {
         }
         
         if (!std::getline(std::cin, line)) break;
+        if (line.empty()) continue;
 
         std::stringstream ss(line);
         std::string command;
@@ -116,62 +236,16 @@ int main() {
             std::lock_guard<std::mutex> cout_lock(cout_mutex);
             std::cout << "--- Client Status ---" << std::endl;
             std::cout << "  Current Target: Replica " << current_target_replica_id.load() << std::endl;
-            for(const auto& config : cluster_config) {
+            for(const auto& config : CLUSTER_CONFIG) {
                 auto it = clients.find(config.id);
                 bool connected = (it != clients.end() && it->second->is_connected());
                 std::cout << "  Replica " << config.id << ": " << (connected ? "CONNECTED" : "DISCONNECTED") << std::endl;
             }
             std::cout << "---------------------" << std::endl;
-        } else if (command == "connect") {
-            std::lock_guard<std::mutex> lock(clients_mutex);
-            std::cout << "Attempting to connect to all replicas..." << std::endl;
-            for (const auto& replica : cluster_config) {
-                auto client = std::make_shared<TcpClient>(loop, replica.host, replica.port);
-                clients[replica.id] = client;
-                int replica_id = replica.id;
-
-                client->set_on_connect([replica_id](auto conn) {
-                    std::lock_guard<std::mutex> cout_lock(cout_mutex);
-                    std::cout << "\n[INFO] Successfully connected to Replica " << replica_id << std::endl;
-                    std::cout << "> " << std::flush;
-                });
-
-                // FIX: On disconnect, check if it was our target. If so, failover.
-                client->set_on_disconnect([replica_id, total_replicas](auto conn) {
-                    std::lock_guard<std::mutex> cout_lock(cout_mutex);
-                    std::cout << "\n[INFO] Disconnected from Replica " << replica_id << std::endl;
-                    if (current_target_replica_id.load() == replica_id) {
-                        // We can't call advance_to_next_replica directly as it would lock the same mutex.
-                        // Instead, we just print a message. The next send will trigger the advance.
-                        std::cout << "[FAILOVER] Current target has disconnected." << std::endl;
-                    }
-                    std::cout << "> " << std::flush;
-                });
-
-                client->set_on_message([replica_id](const std::vector<char>& data) {
-                    vsr_message msg;
-                    std::lock_guard<std::mutex> cout_lock(cout_mutex);
-                    std::cout << "\n[RECV from Replica " << replica_id << "] ";
-                    if (vsr_message::deserialize(data, msg)) {
-                        std::cout << "Cmd: " << static_cast<int>(msg.header.command_)
-                                  << ", Op: " << msg.header.op;
-                        if (!msg.payload.empty()) {
-                            std::string payload_str(msg.payload.begin(), msg.payload.end());
-                            std::cout << ", Payload: '" << payload_str << "'";
-                        }
-                        std::cout << std::endl;
-                    } else {
-                        std::cerr << "Failed to deserialize message." << std::endl;
-                    }
-                    std::cout << "> " << std::flush;
-                });
-
-                client->connect();
-            }
         } else if (command == "ping") {
             vsr_message msg;
             msg.header.command_ = command::ping;
-            send_message(msg, total_replicas);
+            send_message_to_target(msg);
         } else if (command == "get") {
             std::string key;
             if (!(ss >> key)) {
@@ -181,7 +255,7 @@ int main() {
                 msg.header.command_ = command::request;
                 msg.header.operation_ = operation::get;
                 msg.payload.assign(key.begin(), key.end());
-                send_message(msg, total_replicas);
+                send_message_to_target(msg);
             }
         } else if (command == "set") {
             std::string key, value;
@@ -193,15 +267,18 @@ int main() {
                 msg.header.operation_ = operation::set;
                 std::string payload_str = key + " " + value;
                 msg.payload.assign(payload_str.begin(), payload_str.end());
-                send_message(msg, total_replicas);
+                send_message_to_target(msg);
             }
-        } else if (!command.empty()) {
+        } else {
             std::lock_guard<std::mutex> lock(cout_mutex);
             std::cerr << "Unknown command: '" << command << "'. Type 'help' for a list of commands." << std::endl;
         }
     }
 
-    network_thread.detach();
+    // A clean exit is difficult with a detached thread, so we'll just exit.
+    // In a production app, you would signal the network thread to shut down gracefully.
     std::cout << "Exiting client." << std::endl;
+    // Detaching the thread means we don't wait for it. The OS will clean it up.
+    network_thread.detach(); 
     return 0;
 }

@@ -48,6 +48,7 @@ add_executable(server
     src/server/replica_manager.cpp
     src/server/tcp_server.cpp
     src/server/protocol_handler.cpp
+    src/server/replica.cpp
 )
 
 target_include_directories(server PRIVATE

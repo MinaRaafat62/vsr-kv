@@ -4,6 +4,7 @@
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <cstring>
+#include <netinet/tcp.h>
 
 TcpClient::TcpClient(IoUringLoop& loop, const std::string& host, int port)
     : loop_(loop), host_(host), port_(port) {}
@@ -14,6 +15,13 @@ void TcpClient::connect() {
         if (sock < 0) {
             on_connect_failed_();
             return;
+        }
+
+        const int enable = 1;
+        if (setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &enable, sizeof(int)) < 0) {
+            // This is not fatal, so we'll just print a warning.
+            // In a real app, you might log this more formally.
+            perror("setsockopt(TCP_NODELAY) failed");
         }
 
         sockaddr_in server_addr{};

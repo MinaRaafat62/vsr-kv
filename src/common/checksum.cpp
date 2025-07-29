@@ -14,7 +14,7 @@ utilities::uint128_t calculate_checksum_128(std::span<const byte> data) {
     blake3_hasher_update(&hasher, data.data(), data.size());
     blake3_hasher_finalize(&hasher, hash_output, BLAKE3_OUT_LEN);
 
-    // The protocol uses a 128-bit (16-byte) checksum. We take the first 16 bytes
+    // The protocol uses a 128-bit (16-byte) checksum. We will take the first 16 bytes
     utilities::uint128_t result;
     std::memcpy(&result, hash_output, sizeof(result));
     
