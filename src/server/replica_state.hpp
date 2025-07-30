@@ -1,15 +1,21 @@
 #ifndef REPLICA_STATE_HPP
 #define REPLICA_STATE_HPP
 #include "vsr_message.hpp"
+#include "utilities.hpp"
 #include <cstdint>
 #include <map>
 #include <string>
 #include <vector>
+#include <set>
 
 
 struct log_entry {
     uint32_t view;
-    vsr_message msg;
+    operation op_type;
+    utilities::uint128_t client_id;
+    uint32_t request_num;
+    std::vector<byte> payload;
+    std::set<int> prepare_ok_acks;
 };
 
 struct client_table_entry {
@@ -45,7 +51,7 @@ public:
 
     std::map<uint64_t, log_entry> log_;
     std::map<utilities::uint128_t, client_table_entry> client_table_;
-    
+    std::map<std::string, std::string> state_machine_;
     utilities::uint128_t recovery_nonce_ = {0,0};
 
     ReplicaState(int id, std::vector<peer_config> config)

@@ -12,6 +12,17 @@ struct uint128_t {
     bool operator==(const uint128_t& other) const {
         return high == other.high && low == other.low;
     }
+
+    bool operator<(const uint128_t& other) const {
+        if (high < other.high) {
+            return true;
+        }
+        if (high > other.high) {
+            return false;
+        }
+        // If high parts are equal, compare the low parts
+        return low < other.low;
+    }
 };
 
 }
