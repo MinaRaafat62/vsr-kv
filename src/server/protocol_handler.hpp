@@ -22,6 +22,8 @@ public:
 
     // The application layer uses this to send messages without worrying about serialization.
     void send_message(std::shared_ptr<TcpConnection> connection, const vsr_message& msg);
+
+    void send_to_peer(int peer_id, const vsr_message& msg);
     
     // Convenience method for broadcasting.
     void broadcast_to_peers(const vsr_message& msg);

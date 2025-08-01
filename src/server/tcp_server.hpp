@@ -30,6 +30,7 @@ public:
     void set_replica_manager(std::unique_ptr<ReplicaManager> manager);
     void register_new_connection(std::shared_ptr<TcpConnection> connection);
     void broadcast_to_peers(const std::vector<char>& data);
+    void send_to_peer(int peer_id, const std::vector<char>& data);
     void set_on_message(MessageHandler handler);
 
 private:

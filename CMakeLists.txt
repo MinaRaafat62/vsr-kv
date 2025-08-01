@@ -49,6 +49,7 @@ add_executable(server
     src/server/tcp_server.cpp
     src/server/protocol_handler.cpp
     src/server/replica.cpp
+    src/server/view_change_messages.cpp
 )
 
 target_include_directories(server PRIVATE

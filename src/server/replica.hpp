@@ -32,21 +32,29 @@ private:
     void handle_prepare(const inbound_message& inbound);
     void handle_prepare_ok(const inbound_message& inbound);
     void handle_commit(const inbound_message& inbound);
+    void handle_start_view_change(const inbound_message& inbound);
+    void handle_do_view_change(const inbound_message& inbound);
+    void handle_start_view(const inbound_message& inbound);
 
     bool check_can_process_request(const vsr_message& msg) const;
     bool check_can_process_prepare(const vsr_message& msg) const;
     bool check_can_process_prepare_ok(const vsr_message& msg) const;
     bool check_can_process_commit(const vsr_message& msg) const;
-    // bool check_can_process_start_view_change(const vsr_message& msg) const;
-    // bool check_can_process_do_view_change(const vsr_message& msg) const;
-    // bool check_can_process_start_view(const vsr_message& msg) const;
+    bool check_can_process_start_view_change(const vsr_message& msg) const;
+    bool check_can_process_do_view_change(const vsr_message& msg) const;
+    bool check_can_process_start_view(const vsr_message& msg) const;
 
     void execute_commited_ops();
+    void advance_primary_commit_number();
     bool can_process(const inbound_message& inbound);
 
     void schedule_heartbeat();
     void send_commit_message_if_needed();
 
+    void initiate_view_change();
+    void schedule_liveness_check();
+    void check_primary_liveness();
+    std::chrono::steady_clock::time_point last_primary_contact_;
 
     IoUringLoop loop_;
     ReplicaState state_;
@@ -58,8 +66,9 @@ private:
     std::deque<inbound_message> message_queue_;
     std::mutex queue_mutex_;
 
-    const std::chrono::milliseconds heartbeat_interval_{1000};
-    uint64_t last_broadcast_op_ = 0;
+    const std::chrono::milliseconds heartbeat_interval_{200};
+    const std::chrono::milliseconds liveness_check_interval_{200};
+    const std::chrono::milliseconds primary_timeout_{2000}; 
     
 };
 

@@ -1,4 +1,5 @@
 #include "replica.hpp"
+#include "view_change_messages.hpp"
 #include <iostream>
 #include <thread>
 
@@ -47,7 +48,30 @@ void Replica::run() {
     std::cout << "[Replica " << state_.id_ << "] Starting up..." << std::endl;
     server_->start();
     schedule_heartbeat();
+    last_primary_contact_ = std::chrono::steady_clock::now();
+    schedule_liveness_check();
     loop_.run();
+}
+
+void Replica::schedule_liveness_check() {
+    loop_.submit_timeout(liveness_check_interval_, [this](int result) {
+        this->check_primary_liveness();
+    });
+}
+
+void Replica::check_primary_liveness() {
+    if (!state_.is_primary() && state_.status_ == ReplicaStatus::NORMAL) {
+        auto now = std::chrono::steady_clock::now();
+        auto duration_since_contact = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_primary_contact_);
+
+        if (duration_since_contact > primary_timeout_) {
+            std::cout << "[Replica " << state_.id_ << "] Primary timeout expired ("
+                      << duration_since_contact.count() << "ms). Initiating view change." << std::endl;
+            initiate_view_change();
+        }
+    }
+    // Re-schedule the next check to create a continuous polling loop.
+    schedule_liveness_check();
 }
 
 void Replica::schedule_heartbeat() {
@@ -66,6 +90,15 @@ void Replica::process_message_queue() {
         processed_in_pass = false;
         // We iterate through the queue, removing messages we can process.
         for (auto it = message_queue_.begin(); it != message_queue_.end(); ) {
+            if (it->message.header.view > state_.view_){
+                if(state_.status_ == ReplicaStatus::NORMAL){
+                    std::cout << "[Replica " << state_.id_ << "] Message for future view "
+                              << it->message.header.view << " detected. Initiating view change to catch up." << std::endl;
+                    initiate_view_change();
+                }
+                ++it;
+                continue;
+            }
             if (can_process(*it)) {
                 inbound_message message_to_process = *it;
                 
@@ -88,7 +121,15 @@ void Replica::process_message_queue() {
                     case command::commit:
                         handle_commit(message_to_process);
                         break;
-                    // ... other cases
+                    case command::start_view_change:
+                        handle_start_view_change(message_to_process);
+                        break;
+                    case command::do_view_change:
+                        handle_do_view_change(message_to_process);
+                        break;
+                    case command::start_view:
+                        handle_start_view(message_to_process);
+                        break;
                     default:
                         std::cout << "Unknown command" << std::endl;
                 }
@@ -119,7 +160,18 @@ bool Replica::can_process(const inbound_message& inbound) {
             return check_can_process_prepare_ok(msg);
         case command::commit:
             return check_can_process_commit(msg);
+        case command::start_view_change:
+            return check_can_process_start_view_change(msg);
+        case command::do_view_change:
+            return check_can_process_do_view_change(msg);
+        case command::start_view:
+            return check_can_process_start_view(msg);
         default:
+            // If we are in a view change, we might receive messages for the *next* view.
+            // We should keep them in the queue.
+            if (state_.status_ == ReplicaStatus::VIEW_CHANGE && msg.header.view > state_.view_) {
+                return false; // Keep it in the queue, but don't process yet.
+            }
             return false;
     }
 }
@@ -144,8 +196,7 @@ void Replica::handle_ping(const inbound_message& inbound) {
 bool Replica::check_can_process_request(const vsr_message& msg) const {
     // TODO:: we will need to handle state transfer when the view larger than the current view
     return state_.status_ == ReplicaStatus::NORMAL &&
-        state_.is_primary() &&
-        msg.header.view == state_.view_;
+        state_.is_primary();
 }
 
 
@@ -207,6 +258,7 @@ bool Replica::check_can_process_prepare(const vsr_message &msg) const {
 
 
 void Replica::handle_prepare(const inbound_message &inbound) {
+    last_primary_contact_ = std::chrono::steady_clock::now();
     const auto& prepare_msg = inbound.message;
     int primary_id = static_cast<int>(prepare_msg.header.replica);
     std::cout << "[Replica " << state_.id_ << "] Received Prepare for Op " 
@@ -263,10 +315,7 @@ void Replica::handle_prepare_ok(const inbound_message& inbound) {
 
     it->second.prepare_ok_acks.insert(backup_id);
 
-    if (it->second.prepare_ok_acks.size() >= state_.fault_tolerance_f_ + 1) {
-        std::cout << "[Replica " << state_.id_ << "] Op " << op_num << " is now committable." << std::endl;
-        execute_commited_ops();
-    }
+    advance_primary_commit_number();
 }
 
 
@@ -276,9 +325,12 @@ bool Replica::check_can_process_commit(const vsr_message& msg) const {
            msg.header.view == state_.view_;
 }
 
+
+
 void Replica::handle_commit(const inbound_message& inbound) {
+    last_primary_contact_ = std::chrono::steady_clock::now();
     const auto& commit_msg = inbound.message;
-    std::cout << "[Replica " << state_.id_ << "] Received explicit Commit message up to Op " << commit_msg.header.commit << std::endl;
+
     if (commit_msg.header.commit > state_.commit_) {
         state_.commit_ = commit_msg.header.commit;
         execute_commited_ops();
@@ -286,76 +338,281 @@ void Replica::handle_commit(const inbound_message& inbound) {
 }
 
 
+bool Replica::check_can_process_start_view_change(const vsr_message &msg) const {
+    return msg.header.view == state_.view_ && state_.status_ == ReplicaStatus::VIEW_CHANGE;
+}
 
-void Replica::execute_commited_ops() {
-    while(true) {
-        uint64_t next_op_to_commit = state_.commit_ + 1;
-        auto log_it = state_.log_.find(next_op_to_commit);
-        if (log_it == state_.log_.end()) break;
-        if (state_.is_primary() && log_it->second.prepare_ok_acks.size() < state_.fault_tolerance_f_ + 1) break;
+void Replica::handle_start_view_change(const inbound_message &inbound) {
+    const auto& svc_msg = inbound.message;
+    const auto& header = svc_msg.header;
 
-        const auto& entry_to_execute = log_it->second;
-        auto& client_entry = state_.client_table_[entry_to_execute.client_id];
+    std::cout << "[Replica " << state_.id_ << "] Received StartViewChange for view " << header.view
+              << " from replica " << static_cast<int>(header.replica) << std::endl;
+    
+    state_.start_view_change_received_.insert(header.replica);
+    if (state_.start_view_change_received_.size() >= state_.fault_tolerance_f_ + 1) {
+        std::cout << "[Replica " << state_.id_ << "] Quorum for StartViewChange met. Sending DoViewChange to new primary." << std::endl;
+        state_.start_view_change_received_.clear();
+        // Prepare the payload with our state.
+        do_view_change_payload dvc_payload;
+        dvc_payload.last_normal_view = state_.last_normal_view_;
+        dvc_payload.log = state_.log_;
 
-        std::string result_str = "OK";
+        // Wrap it in a VSR message. The header contains our current op/commit numbers.
+        vsr_message msg;
+        msg.header.command_ = command::do_view_change;
+        msg.header.view = state_.view_;
+        msg.header.op = state_.op_;
+        msg.header.commit = state_.commit_;
+        msg.header.replica = state_.id_;
+        msg.payload = dvc_payload.serialize();
 
-        if (!client_entry.executed) {
-            std::cout << "[Replica " << state_.id_ << "] Executing Op " << next_op_to_commit << std::endl;
-            
-            std::string payload_str(entry_to_execute.payload.begin(), entry_to_execute.payload.end());
-            std::stringstream ss(payload_str);
-            std::string key, value;
+        // Send the message ONLY to the prospective primary of the new view.
+        int new_primary_id = state_.get_primary_id_for_view(state_.view_);
+        if (new_primary_id == state_.id_) {
+            std::cout << "[Replica " << state_.id_ << "] I am the new primary. Processing my own DoViewChange state." << std::endl;
+            inbound_message self_dvc_inbound = { nullptr, msg };
+            handle_do_view_change(self_dvc_inbound);
+        } else{
+            protocol_handler_->send_to_peer(new_primary_id, msg);
+        }
+    }
+    
+}
 
-            if (entry_to_execute.op_type == operation::set) {
-                ss >> key >> value;
-                state_.state_machine_[key] = value;
-                result_str = "SET " + key + "=" + value;
-            } else if (entry_to_execute.op_type == operation::get) {
-                ss >> key;
-                if (state_.state_machine_.count(key)) {
-                    result_str = state_.state_machine_[key];
-                } else {
-                    result_str = "NOT_FOUND";
+
+bool Replica::check_can_process_do_view_change(const vsr_message &msg) const {
+   if (msg.header.view != state_.view_) return false;
+   if (state_.status_ != ReplicaStatus::VIEW_CHANGE) return false;
+   if (state_.get_primary_id_for_view(state_.view_) != state_.id_) return false;
+   return true;
+}
+
+void Replica::handle_do_view_change(const inbound_message &inbound) {
+    const auto& dvc_msg = inbound.message;
+    const auto& header = dvc_msg.header;
+     std::cout << "[Replica " << state_.id_ << "] Processing DoViewChange for view " << header.view
+              << " from replica " << static_cast<int>(header.replica) << std::endl;
+    state_.do_view_change_received_.emplace_back(dvc_msg);
+    
+    if (state_.do_view_change_received_.size() >= state_.fault_tolerance_f_ + 1) {
+        std::cout << "[Replica " << state_.id_ << "] Quorum for DoViewChange met. Selecting log and becoming primary." << std::endl;
+
+        auto received_messages = state_.do_view_change_received_;
+        state_.do_view_change_received_.clear();
+
+        do_view_change_payload best_payload;
+        do_view_change_payload::deserialize(received_messages[0].payload, best_payload);
+        uint64_t best_op = received_messages[0].header.op;
+        uint64_t max_commit = std::max(state_.commit_, received_messages[0].header.commit);
+
+        for (size_t i = 1; i < received_messages.size(); ++i) {
+            const auto& current_msg = received_messages[i];
+            do_view_change_payload current_payload;
+
+            if (do_view_change_payload::deserialize(current_msg.payload, current_payload)) {
+                
+                if (current_payload.last_normal_view > best_payload.last_normal_view) {
+                    best_payload = current_payload;
+                    best_op = current_msg.header.op;
+                } else if (current_payload.last_normal_view == best_payload.last_normal_view &&
+                           current_msg.header.op > best_op) {
+                    best_payload = current_payload;
+                    best_op = current_msg.header.op;
                 }
+                max_commit = std::max(max_commit, current_msg.header.commit);
             }
-
-            client_entry.executed = true;
-            client_entry.result.assign(result_str.begin(), result_str.end());
         }
+
+        state_.log_ = best_payload.log;
+        state_.op_ = best_op;
+        state_.commit_ = max_commit;
+        state_.status_ = ReplicaStatus::NORMAL;
+        std::cout << "[Replica " << state_.id_ << "] New state adopted: op=" << state_.op_
+                  << ", commit=" << state_.commit_ << ". Broadcasting StartView." << std::endl;
         
-        state_.commit_ = next_op_to_commit;
+        start_view_payload sv_payload;
+        sv_payload.log = state_.log_;
 
-        if (state_.is_primary()) {
-            auto client_conn_it = client_connections_.find(entry_to_execute.client_id);
-            if (client_conn_it != client_connections_.end() && client_conn_it->second) {
-                std::cout << "[Replica " << state_.id_ << "] Sending Reply for request " << entry_to_execute.request_num << " to client." << std::endl;
-            }
-            vsr_message reply_msg;
-            reply_msg.header.command_ = command::reply;
-            reply_msg.header.view = state_.view_;
-            reply_msg.header.client = entry_to_execute.client_id;
-            reply_msg.header.request = entry_to_execute.request_num;
-            reply_msg.payload = client_entry.result;
-            protocol_handler_->send_message(client_conn_it->second, reply_msg);
-        }
+        vsr_message msg;
+        msg.header.command_ = command::start_view;
+        msg.header.view = state_.view_;
+        msg.header.op = state_.op_;
+        msg.header.commit = state_.commit_;
+        msg.header.replica = state_.id_;
+        msg.payload = sv_payload.serialize();
+        protocol_handler_->broadcast_to_peers(msg);
+
+        execute_commited_ops();
     }
 }
 
+bool Replica::check_can_process_start_view(const vsr_message &msg) const {
+    if (msg.header.view != state_.view_) return false;
+    if (state_.status_ != ReplicaStatus::VIEW_CHANGE) return false;
+    if (msg.header.replica != state_.get_primary_id_for_view(state_.view_)) return false;
+    return true;
+}
+
+void Replica::handle_start_view(const inbound_message &inbound) {
+    const auto& sv_msg = inbound.message;
+    const auto& header = sv_msg.header;
+    std::cout << "[Replica " << state_.id_ << "] Processing StartView for view " << header.view
+              << ". Adopting new state from primary " << static_cast<int>(header.replica) << "." << std::endl;
+
+    start_view_payload sv_payload;
+    
+    if (!start_view_payload::deserialize(inbound.message.payload, sv_payload)) {
+        std::cerr << "Critical error: Failed to deserialize StartView payload." << std::endl;
+        // In a real system, this might trigger another view change.
+        return;
+    }
+
+    state_.view_ = header.view;
+    state_.op_ = header.op;
+    state_.commit_ = header.commit;
+    state_.log_ = sv_payload.log;
+    state_.status_ = ReplicaStatus::NORMAL;
+    last_primary_contact_ = std::chrono::steady_clock::now();
+
+    for (const auto& [op_num, entry] : state_.log_) {
+        auto& client_entry = state_.client_table_[entry.client_id];
+        if (entry.request_num > client_entry.request_number) {
+            client_entry.request_number = entry.request_num;
+            client_entry.executed = false;
+        }
+    }
+
+    execute_commited_ops();
+
+    int primary_id = state_.get_primary_id();
+    for (uint64_t op_num = state_.commit_ + 1; op_num <= state_.op_; ++op_num) {
+        std::cout << "[Replica " << state_.id_ << "] Sending retroactive PrepareOk for op " << op_num << " to new primary." << std::endl;
+        vsr_message prepare_ok_msg;
+        prepare_ok_msg.header.command_ = command::prepare_ok;
+        prepare_ok_msg.header.view = state_.view_;
+        prepare_ok_msg.header.op = op_num;
+        prepare_ok_msg.header.replica = state_.id_;
+        
+        protocol_handler_->send_to_peer(primary_id, prepare_ok_msg);
+    }
+}
+
+
+
+void Replica::execute_commited_ops() {
+    // This loop ensures the state machine catches up to the committed log state.
+    while (state_.last_executed_op_ < state_.commit_) {
+        uint64_t op_to_execute = state_.last_executed_op_ + 1;
+        auto log_it = state_.log_.find(op_to_execute);
+
+        // If the log entry isn't present, we can't proceed.
+        // This might happen during state transfer, so we must wait.
+        if (log_it == state_.log_.end()) {
+            break;
+        }
+
+        const auto& entry = log_it->second;
+        auto& client_entry = state_.client_table_[entry.client_id];
+
+        // Only execute if it hasn't been done before for this specific request.
+        // This prevents re-executing the same operation if this function is called multiple times.
+        if (client_entry.request_number != entry.request_num || !client_entry.executed) {
+            std::cout << "[Replica " << state_.id_ << "] Executing Op " << op_to_execute << std::endl;
+
+            std::string result_str;
+            std::string payload_str(entry.payload.begin(), entry.payload.end());
+            std::stringstream ss(payload_str);
+            std::string key, value;
+
+            if (entry.op_type == operation::set) {
+                ss >> key >> value;
+                state_.state_machine_[key] = value;
+                result_str = "SET " + key + "=" + value;
+            } else if (entry.op_type == operation::get) {
+                ss >> key;
+                result_str = state_.state_machine_.count(key) ? state_.state_machine_[key] : "NOT_FOUND";
+            }
+
+            // Update the client table with the result and mark as executed.
+            client_entry.request_number = entry.request_num;
+            client_entry.executed = true;
+            client_entry.result.assign(result_str.begin(), result_str.end());
+
+            // If we are the primary that just executed this, we must send the reply.
+            if (state_.is_primary()) {
+                auto client_conn_it = client_connections_.find(entry.client_id);
+                if (client_conn_it != client_connections_.end() && client_conn_it->second) {
+                    std::cout << "[Replica " << state_.id_ << "] Sending Reply for request " << entry.request_num << " to client." << std::endl;
+                    vsr_message reply_msg;
+                    reply_msg.header.command_ = command::reply;
+                    reply_msg.header.view = state_.view_;
+                    reply_msg.header.client = entry.client_id;
+                    reply_msg.header.request = entry.request_num;
+                    reply_msg.payload = client_entry.result;
+                    protocol_handler_->send_message(client_conn_it->second, reply_msg);
+                }
+            }
+        }
+
+        // Advance our personal execution counter.
+        state_.last_executed_op_ = op_to_execute;
+    }
+}
 
 void Replica::send_commit_message_if_needed() {
     if (!state_.is_primary() || state_.status_ != ReplicaStatus::NORMAL) {
         return;
     }
 
-    if (state_.commit_ > 0 && last_broadcast_op_ < state_.commit_) {
-        std::cout << "[Replica " << state_.id_ << "] Idle. Sending explicit Commit message for commit_ " << state_.commit_ << std::endl;
-        
-        vsr_message commit_msg;
-        commit_msg.header.command_ = command::commit;
-        commit_msg.header.view = state_.view_;
-        commit_msg.header.commit = state_.commit_;
-        
-        protocol_handler_->broadcast_to_peers(commit_msg);
-        last_broadcast_op_ = state_.commit_; // Update our tracker
+    vsr_message commit_msg;
+    commit_msg.header.command_ = command::commit;
+    commit_msg.header.view = state_.view_;
+    commit_msg.header.commit = state_.commit_;
+    protocol_handler_->broadcast_to_peers(commit_msg);
+}
+
+void Replica::initiate_view_change() {
+    state_.enter_new_view(state_.view_ + 1);
+    std::cout << "[Replica " << state_.id_ << "] Starting View Change for view " << state_.view_ << std::endl;
+
+    vsr_message svc_msg;
+    svc_msg.header.command_ = command::start_view_change;
+    svc_msg.header.view = state_.view_;
+    svc_msg.header.replica = state_.id_;
+    protocol_handler_->broadcast_to_peers(svc_msg);
+}
+
+
+
+void Replica::advance_primary_commit_number() {
+    // This function should only be called on the primary.
+    if (!state_.is_primary()) {
+        return;
     }
+
+    // Try to advance the commit number as far as possible.
+    // This loop handles cases where multiple operations can be committed at once.
+    while (true) {
+        uint64_t next_op_to_commit = state_.commit_ + 1;
+        auto it = state_.log_.find(next_op_to_commit);
+
+        // Stop if the next operation is not in our log.
+        if (it == state_.log_.end()) {
+            break;
+        }
+
+        // Stop if the operation doesn't have enough acknowledgements yet.
+        if (it->second.prepare_ok_acks.size() < state_.fault_tolerance_f_ + 1) {
+            break;
+        }
+
+        // This operation is now officially committed. Advance the counter.
+        state_.commit_ = next_op_to_commit;
+        std::cout << "[Replica " << state_.id_ << "] Advanced commit number to " << state_.commit_ << std::endl;
+    }
+
+    // After advancing the commit number, execute any newly committed operations
+    // to apply them to the state machine and reply to clients.
+    execute_commited_ops();
 }
