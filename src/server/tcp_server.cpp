@@ -137,6 +137,12 @@ void TcpServer::remove_connection(const std::shared_ptr<TcpConnection>& connecti
     }
 }
 
+void TcpServer::send_to_peer(int peer_id, const std::vector<char>& data) {
+    if (replica_manager_) {
+        replica_manager_->send_to_peer(peer_id, data);
+    }
+}
+
 void TcpServer::broadcast_to_peers(const std::vector<char>& data) {
     if (replica_manager_) {
         replica_manager_->broadcast_to_peers(data);

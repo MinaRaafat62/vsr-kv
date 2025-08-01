@@ -1,7 +1,7 @@
 #ifndef REPLICA_STATE_HPP
 #define REPLICA_STATE_HPP
 #include "vsr_message.hpp"
-#include "utilities.hpp"
+#include "replica_types.hpp"
 #include <cstdint>
 #include <map>
 #include <string>
@@ -9,20 +9,7 @@
 #include <set>
 
 
-struct log_entry {
-    uint32_t view;
-    operation op_type;
-    utilities::uint128_t client_id;
-    uint32_t request_num;
-    std::vector<byte> payload;
-    std::set<int> prepare_ok_acks;
-};
 
-struct client_table_entry {
-    uint32_t request_number = 0;
-    bool executed = false;
-    std::vector<byte> result;
-};
 
 
 enum class ReplicaStatus {
@@ -48,11 +35,16 @@ public:
     uint32_t view_ = 0;
     uint64_t op_ = 0;
     uint64_t commit_ = 0;
+    uint64_t last_executed_op_ = 0;
 
     std::map<uint64_t, log_entry> log_;
     std::map<utilities::uint128_t, client_table_entry> client_table_;
     std::map<std::string, std::string> state_machine_;
     utilities::uint128_t recovery_nonce_ = {0,0};
+    uint32_t last_normal_view_ = 0;
+    std::set<int> start_view_change_received_;
+    std::vector<vsr_message> do_view_change_received_;
+
 
     ReplicaState(int id, std::vector<peer_config> config)
         : id_(id),
@@ -69,6 +61,25 @@ public:
 
     bool is_primary() const {
         return id_ == get_primary_id();
+    }
+
+    void enter_new_view(uint32_t new_view) {
+        if (status_ == ReplicaStatus::NORMAL) {
+            last_normal_view_ = view_;
+        }
+        view_ = new_view;
+        status_ = ReplicaStatus::VIEW_CHANGE;
+        start_view_change_received_.clear();
+        do_view_change_received_.clear();
+        start_view_change_received_.insert(id_); // adding self to the start view change received
+    }
+
+    int get_primary_id_for_view(uint32_t view_num) const {
+        const size_t cluster_size = cluster_config_.size();
+        if (cluster_size == 0) {
+            return -1; 
+        }
+        return view_num % cluster_size;
     }
 };
 

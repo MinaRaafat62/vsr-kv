@@ -95,6 +95,15 @@ void ProtocolHandler::send_message(std::shared_ptr<TcpConnection> connection, co
     server_.send(connection, serialized_msg_char);
 }
 
+void ProtocolHandler::send_to_peer(int peer_id, const vsr_message& msg) {
+    std::vector<byte> serialized_msg_byte = msg.serialize();
+    std::vector<char> serialized_msg_char(
+        reinterpret_cast<char*>(serialized_msg_byte.data()),
+        reinterpret_cast<char*>(serialized_msg_byte.data() + serialized_msg_byte.size())
+    );
+    server_.send_to_peer(peer_id, serialized_msg_char);
+}
+
 void ProtocolHandler::broadcast_to_peers(const vsr_message& msg) {
     std::vector<byte> serialized_msg_byte = msg.serialize();
     std::vector<char> serialized_msg_char(

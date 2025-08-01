@@ -26,7 +26,6 @@ void ReplicaManager::connect_to_peers() {
 
 void ReplicaManager::attempt_connection(Peer& peer) {
     if (peer.state != Peer::State::DISCONNECTED) return;
-    std::cout << "[Replica " << self_id_ << "] Attempting to connect to Peer " << peer.id << std::endl;
     peer.state = Peer::State::CONNECTING;
     int sock = socket(AF_INET, SOCK_STREAM, 0);
     if (sock < 0) { peer.state = Peer::State::DISCONNECTED; schedule_reconnect(peer); return; }
@@ -84,7 +83,6 @@ void ReplicaManager::on_disconnect(const std::shared_ptr<TcpConnection>& connect
 }
 
 void ReplicaManager::schedule_reconnect(Peer& peer) {
-    std::cout << "[Replica " << self_id_ << "] Scheduling reconnect to Peer " << peer.id << " in " << reconnect_delay_.count() << " seconds." << std::endl;
     loop_.submit_timeout(reconnect_delay_, [this, &peer](int result) {
         attempt_connection(peer);
     });
