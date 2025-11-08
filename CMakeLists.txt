@@ -50,6 +50,7 @@ add_executable(server
     src/server/protocol_handler.cpp
     src/server/replica.cpp
     src/server/view_change_messages.cpp
+    src/server/serialization.cpp
 )
 
 target_include_directories(server PRIVATE
