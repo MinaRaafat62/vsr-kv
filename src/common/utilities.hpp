@@ -2,6 +2,8 @@
 #define UTILITIES_HPP
 
 #include <cstdint>
+#include <atomic>
+#include <ctime>
 
 namespace utilities {
 
@@ -24,6 +26,9 @@ struct uint128_t {
         return low < other.low;
     }
 };
+
+
+uint128_t generate_nonce(int replica_id);
 
 }
 

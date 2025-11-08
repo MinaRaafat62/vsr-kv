@@ -31,6 +31,7 @@ add_library(vsr_common STATIC
     src/common/tcp_connection.cpp
     src/common/vsr_message.cpp
     src/common/checksum.cpp
+    src/common/utilities.cpp
 )
 
 target_include_directories(vsr_common PUBLIC
@@ -51,6 +52,7 @@ add_executable(server
     src/server/replica.cpp
     src/server/view_change_messages.cpp
     src/server/serialization.cpp
+    src/server/recovery_messages.cpp
 )
 
 target_include_directories(server PRIVATE

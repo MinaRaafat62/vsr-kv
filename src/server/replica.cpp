@@ -1,5 +1,6 @@
 #include "replica.hpp"
 #include "view_change_messages.hpp"
+#include "recovery_messages.hpp"
 #include <iostream>
 #include <thread>
 
@@ -83,67 +84,88 @@ void Replica::schedule_heartbeat() {
     });
 }
 
-
 void Replica::process_message_queue() {
-    bool processed_in_pass = false;
+    bool processed_in_pass;
     do {
         processed_in_pass = false;
-        // We iterate through the queue, removing messages we can process.
-        for (auto it = message_queue_.begin(); it != message_queue_.end(); ) {
-            if (it->message.header.view > state_.view_){
-                if(state_.status_ == ReplicaStatus::NORMAL){
-                    std::cout << "[Replica " << state_.id_ << "] Message for future view "
-                              << it->message.header.view << " detected. Initiating view change to catch up." << std::endl;
-                    initiate_view_change();
-                }
-                ++it;
+
+        while (!message_queue_.empty()) {
+            const auto& msg = message_queue_.front().message;
+
+            if (msg.header.command_ != command::request &&
+                msg.header.command_ != command::recovery &&
+                msg.header.view < state_.view_)
+            {
+                std::cout << "[Replica " << state_.id_ << "] Discarding stale server message from past view "
+                          << msg.header.view << "." << std::endl;
+                message_queue_.pop_front();
+                processed_in_pass = true;
                 continue;
             }
-            if (can_process(*it)) {
-                inbound_message message_to_process = *it;
-                
-                // Remove from queue BEFORE processing
-                it = message_queue_.erase(it); 
-                
-                switch (message_to_process.message.header.command_) {
+
+            if (can_process(message_queue_.front())) {
+                inbound_message msg_to_process = message_queue_.front();
+                message_queue_.pop_front();
+                processed_in_pass = true;
+
+                switch (msg_to_process.message.header.command_) {
                     case command::ping:
-                        handle_ping(message_to_process);
+                        handle_ping(msg_to_process);
                         break;
                     case command::request:
-                        handle_request(message_to_process);
+                        handle_request(msg_to_process);
                         break;
                     case command::prepare:
-                        handle_prepare(message_to_process);
+                        handle_prepare(msg_to_process);
                         break;
                     case command::prepare_ok:
-                        handle_prepare_ok(message_to_process);
+                        handle_prepare_ok(msg_to_process);
                         break;
                     case command::commit:
-                        handle_commit(message_to_process);
+                        handle_commit(msg_to_process);
                         break;
                     case command::start_view_change:
-                        handle_start_view_change(message_to_process);
+                        handle_start_view_change(msg_to_process);
                         break;
                     case command::do_view_change:
-                        handle_do_view_change(message_to_process);
+                        handle_do_view_change(msg_to_process);
                         break;
                     case command::start_view:
-                        handle_start_view(message_to_process);
+                        handle_start_view(msg_to_process);
+                        break;
+                    case command::recovery:
+                        handle_recovery_request(msg_to_process);
+                        break;
+                    case command::recovery_response:
+                        handle_recovery_response(msg_to_process);
                         break;
                     default:
-                        std::cout << "Unknown command" << std::endl;
+                        std::cerr << "Warning: Unknown command in message queue." << std::endl;
+                        break;
                 }
-                processed_in_pass = true;
             } else {
-                // Can't process this message yet, leave it in the queue.
-                ++it;
+                break;
             }
         }
-        // If we processed a message, we loop again, because that processing
-        // might have unblocked other messages in the queue.
+
+        if (!message_queue_.empty() && state_.status_ == ReplicaStatus::NORMAL) {
+            const auto& stuck_msg = message_queue_.front().message;
+            StateAction action = determine_state_action(stuck_msg);
+
+            switch (action) {
+                case StateAction::INITIATE_RECOVERY:
+                    initiate_recovery();
+                    message_queue_.clear();
+                    break;
+                case StateAction::INITIATE_VIEW_CHANGE:
+                    initiate_view_change();
+                    break;
+                case StateAction::PROCESS_NORMALLY:
+                    break;
+            }
+        }
     } while (processed_in_pass);
 }
-
 
 bool Replica::can_process(const inbound_message& inbound) {
     const auto& msg = inbound.message;
@@ -166,6 +188,10 @@ bool Replica::can_process(const inbound_message& inbound) {
             return check_can_process_do_view_change(msg);
         case command::start_view:
             return check_can_process_start_view(msg);
+        case command::recovery:
+            return check_can_process_recovery_request(msg);
+        case command::recovery_response:
+            return check_can_process_recovery_response(msg);
         default:
             // If we are in a view change, we might receive messages for the *next* view.
             // We should keep them in the queue.
@@ -454,6 +480,14 @@ bool Replica::check_can_process_start_view(const vsr_message &msg) const {
     return true;
 }
 
+bool Replica::check_can_process_recovery_request(const vsr_message &msg) const {
+    return state_.status_ == ReplicaStatus::NORMAL;
+}
+
+bool Replica::check_can_process_recovery_response(const vsr_message& msg) const {
+    return state_.status_ == ReplicaStatus::RECOVERY;
+}
+
 void Replica::handle_start_view(const inbound_message &inbound) {
     const auto& sv_msg = inbound.message;
     const auto& header = sv_msg.header;
@@ -467,6 +501,8 @@ void Replica::handle_start_view(const inbound_message &inbound) {
         // In a real system, this might trigger another view change.
         return;
     }
+
+    uint64_t new_primary_commit_number = header.commit;
 
     state_.view_ = header.view;
     state_.op_ = header.op;
@@ -486,19 +522,111 @@ void Replica::handle_start_view(const inbound_message &inbound) {
     execute_commited_ops();
 
     int primary_id = state_.get_primary_id();
-    for (uint64_t op_num = state_.commit_ + 1; op_num <= state_.op_; ++op_num) {
-        std::cout << "[Replica " << state_.id_ << "] Sending retroactive PrepareOk for op " << op_num << " to new primary." << std::endl;
-        vsr_message prepare_ok_msg;
-        prepare_ok_msg.header.command_ = command::prepare_ok;
-        prepare_ok_msg.header.view = state_.view_;
-        prepare_ok_msg.header.op = op_num;
-        prepare_ok_msg.header.replica = state_.id_;
-        
-        protocol_handler_->send_to_peer(primary_id, prepare_ok_msg);
+    for (uint64_t op_num = new_primary_commit_number + 1; op_num <= state_.op_; ++op_num) {
+        if (state_.log_.count(op_num)) {
+            std::cout << "[Replica " << state_.id_ << "] Sending retroactive PrepareOk for op " << op_num << " to new primary." << std::endl;
+            vsr_message prepare_ok_msg;
+            prepare_ok_msg.header.command_ = command::prepare_ok;
+            prepare_ok_msg.header.view = state_.view_;
+            prepare_ok_msg.header.op = op_num;
+            prepare_ok_msg.header.replica = state_.id_;
+            
+            protocol_handler_->send_to_peer(primary_id, prepare_ok_msg);
+        }
     }
 }
 
+void Replica::handle_recovery_request(const inbound_message &inbound) {
+    const auto& recovery_msg = inbound.message;
+    int recovering_replica_id = recovery_msg.header.replica;
 
+    recovery_request_payload req_payload;
+    if (!recovery_request_payload::deserialize(recovery_msg.payload, req_payload)) {
+        std::cerr << "Failed to deserialize recovery request payload from replica " 
+                  << recovering_replica_id << std::endl;
+        return;
+    }
+
+    std::cout << "[Replica " << state_.id_ << "] Received recovery request from Replica " << recovering_replica_id << ". Responding with current state." << std::endl;
+
+    recovery_response_payload res_payload;
+    res_payload.nonce = req_payload.nonce;
+    res_payload.log = state_.log_;
+
+    vsr_message response_msg;
+    response_msg.header.command_ = command::recovery_response;
+    response_msg.header.replica = state_.id_;
+    response_msg.header.view = state_.view_;
+    response_msg.header.op = state_.op_;
+    response_msg.header.commit = state_.commit_;
+    response_msg.payload = res_payload.serialize();
+
+    protocol_handler_->send_to_peer(recovering_replica_id, response_msg);
+}
+
+void Replica::handle_recovery_response(const inbound_message &inbound) {
+    const auto& response_msg = inbound.message;
+    int responder_id = response_msg.header.replica;
+
+    recovery_response_payload res_payload;
+    if (!recovery_response_payload::deserialize(response_msg.payload, res_payload)) {
+        std::cerr << "[Replica " << state_.id_ << "] Error: Failed to deserialize recovery response from replica " << responder_id << "." << std::endl;
+        return;
+    }
+
+    if (!(res_payload.nonce == state_.recovery_nonce_)) {
+        std::cout << "[Replica " << state_.id_ << "] Ignoring recovery response from replica " << responder_id << " with old nonce." << std::endl;
+        return;
+    }
+
+    std::cout << "[Replica " << state_.id_ << "] Received valid recovery response from Replica " << responder_id << "." << std::endl;
+    state_.recovery_responses_.push_back(response_msg);
+
+    if (state_.recovery_responses_.size() >= state_.fault_tolerance_f_ + 1) {
+        std::cout << "[Replica " << state_.id_ << "] Recovery quorum met. Processing responses to find best state." << std::endl;
+
+        const vsr_message* best_response = &state_.recovery_responses_[0];
+        for (size_t i = 1; i < state_.recovery_responses_.size(); ++i) {
+            const auto& current_response = state_.recovery_responses_[i];
+            if (current_response.header.view > best_response->header.view) {
+                best_response = &current_response;
+            } else if (current_response.header.view == best_response->header.view &&
+                       current_response.header.op > best_response->header.op) {
+                best_response = &current_response;
+            }
+        }
+
+        recovery_response_payload best_payload;
+        recovery_response_payload::deserialize(best_response->payload, best_payload);
+
+
+        state_.view_ = best_response->header.view;
+        state_.op_ = best_response->header.op;
+        state_.commit_ = best_response->header.commit;
+        state_.log_ = best_payload.log;
+        state_.last_executed_op_ = 0;
+
+        last_primary_contact_ = std::chrono::steady_clock::now();
+
+        state_.status_ = ReplicaStatus::NORMAL;
+        std::cout << "[Replica " << state_.id_ << "] Recovery complete! New state: view=" << state_.view_
+                  << ", op=" << state_.op_ << ", commit=" << state_.commit_ << std::endl;
+
+
+        state_.client_table_.clear();
+        for (const auto& [op_num, entry] : state_.log_) {
+            auto& client_entry = state_.client_table_[entry.client_id];
+            if (entry.request_num > client_entry.request_number) {
+                client_entry.request_number = entry.request_num;
+                client_entry.executed = false;
+            }
+        }
+        execute_commited_ops();
+        
+        state_.recovery_nonce_ = {0,0};
+        state_.recovery_responses_.clear();
+    }
+}
 
 void Replica::execute_commited_ops() {
     // This loop ensures the state machine catches up to the committed log state.
@@ -583,7 +711,68 @@ void Replica::initiate_view_change() {
     protocol_handler_->broadcast_to_peers(svc_msg);
 }
 
+void Replica::initiate_recovery() {
+    if (state_.status_ == ReplicaStatus::RECOVERY) {
+        return;
+    }
 
+    state_.status_ = ReplicaStatus::RECOVERY;
+    std::cout << "[Replica " << state_.id_ << "] Detected state is out of sync. Entering recovery mode." << std::endl;
+    
+    state_.recovery_nonce_ = utilities::generate_nonce(state_.id_);
+    state_.recovery_responses_.clear();
+
+    recovery_request_payload req_payload;
+    req_payload.nonce = state_.recovery_nonce_;
+
+    vsr_message recovery_msg;
+    recovery_msg.header.command_ = command::recovery;
+    recovery_msg.header.replica = state_.id_;
+    recovery_msg.payload = req_payload.serialize();
+
+    protocol_handler_->broadcast_to_peers(recovery_msg);
+    std::cout << "[Replica " << state_.id_ << "] Broadcasting recovery request." << std::endl;
+
+}
+
+StateAction Replica::determine_state_action(const vsr_message& stuck_msg) const {
+    // This function is only called when we are stuck, so we are guaranteed to be in a NORMAL state.
+    
+    // --- TRIGGER 1: Stuck on a message from a future view ---
+    if (stuck_msg.header.view > state_.view_) {
+        // If a view change for the *next* view is in progress, we should join it.
+        if (stuck_msg.header.view == state_.view_ + 1 &&
+            (stuck_msg.header.command_ == command::start_view_change || stuck_msg.header.command_ == command::do_view_change))
+        {
+            std::cout << "[Replica " << state_.id_ << "] Trigger: Stuck on view change message for next view " 
+                      << stuck_msg.header.view << ". Initiating view change to participate." << std::endl;
+            return StateAction::INITIATE_VIEW_CHANGE;
+        }
+        // Otherwise, the cluster has moved on without us. We are lost and must recover.
+        else
+        {
+            std::cout << "[Replica " << state_.id_ << "] Trigger: Stuck on message from future view " << stuck_msg.header.view
+                      << " (current is " << state_.view_ << "). Needs recovery." << std::endl;
+            return StateAction::INITIATE_RECOVERY;
+        }
+    }
+
+    // --- TRIGGER 2: Stuck on a Prepare message in the current view with a log gap ---
+    // This is the critical case for a rebooted backup.
+    if (!state_.is_primary() &&
+        stuck_msg.header.command_ == command::prepare &&
+        stuck_msg.header.view == state_.view_ &&
+        stuck_msg.header.op > state_.op_ + 1) 
+    {
+        std::cout << "[Replica " << state_.id_ << "] Trigger: Stuck waiting for op " << state_.op_ + 1 
+                  << ", but next in queue is op " << stuck_msg.header.op << ". Needs recovery." << std::endl;
+        return StateAction::INITIATE_RECOVERY;
+    }
+
+    // If we are stuck for any other reason (e.g., a backup receiving a client request),
+    // it's a normal condition, and we just need to wait. No special action is needed.
+    return StateAction::PROCESS_NORMALLY;
+}
 
 void Replica::advance_primary_commit_number() {
     // This function should only be called on the primary.

@@ -41,6 +41,7 @@ public:
     std::map<utilities::uint128_t, client_table_entry> client_table_;
     std::map<std::string, std::string> state_machine_;
     utilities::uint128_t recovery_nonce_ = {0,0};
+    std::vector<vsr_message> recovery_responses_;
     uint32_t last_normal_view_ = 0;
     std::set<int> start_view_change_received_;
     std::vector<vsr_message> do_view_change_received_;

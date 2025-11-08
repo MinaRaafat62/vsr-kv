@@ -16,6 +16,12 @@ struct inbound_message {
     vsr_message message;
 };
 
+enum class StateAction {
+    PROCESS_NORMALLY,
+    INITIATE_VIEW_CHANGE,
+    INITIATE_RECOVERY
+};
+
 class Replica {
 public:
     Replica(int id, std::vector<peer_config> cluster_config);
@@ -35,6 +41,8 @@ private:
     void handle_start_view_change(const inbound_message& inbound);
     void handle_do_view_change(const inbound_message& inbound);
     void handle_start_view(const inbound_message& inbound);
+    void handle_recovery_request(const inbound_message& inbound);
+    void handle_recovery_response(const inbound_message& inbound);
 
     bool check_can_process_request(const vsr_message& msg) const;
     bool check_can_process_prepare(const vsr_message& msg) const;
@@ -43,6 +51,8 @@ private:
     bool check_can_process_start_view_change(const vsr_message& msg) const;
     bool check_can_process_do_view_change(const vsr_message& msg) const;
     bool check_can_process_start_view(const vsr_message& msg) const;
+    bool check_can_process_recovery_request(const vsr_message& msg) const;
+    bool check_can_process_recovery_response(const vsr_message& msg) const;
 
     void execute_commited_ops();
     void advance_primary_commit_number();
@@ -52,6 +62,10 @@ private:
     void send_commit_message_if_needed();
 
     void initiate_view_change();
+    void initiate_recovery();
+
+    StateAction determine_state_action(const vsr_message& msg) const;
+
     void schedule_liveness_check();
     void check_primary_liveness();
     std::chrono::steady_clock::time_point last_primary_contact_;
@@ -69,6 +83,7 @@ private:
     const std::chrono::milliseconds heartbeat_interval_{200};
     const std::chrono::milliseconds liveness_check_interval_{200};
     const std::chrono::milliseconds primary_timeout_{2000}; 
+    const std::chrono::milliseconds recovery_interval_{3000};
     
 };
 
