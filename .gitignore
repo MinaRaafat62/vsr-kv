@@ -1,2 +1,12 @@
 .vscode
 build/
+.idea/
+*.log
+*.tmp
+.DS_Store
+node_modules/
+dist/
+.env
+coverage/
+*.bak
+*.swp
