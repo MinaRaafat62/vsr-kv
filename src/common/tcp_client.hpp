@@ -6,7 +6,8 @@
 #include <functional>
 #include <string>
 #include <memory>
-#include <atomic> // Required for std::atomic
+#include <atomic>
+#include <chrono>
 
 using ConnectionCallback = std::function<void(std::shared_ptr<TcpConnection>)>;
 using MessageCallback = std::function<void(const std::vector<char>&)>;
@@ -18,8 +19,6 @@ public:
 
     void connect();
     void send(const std::vector<char>& data);
-
-    // A public method to check the connection state.
     bool is_connected() const;
 
     void set_on_connect(ConnectionCallback handler);
@@ -30,19 +29,23 @@ public:
 private:
     void start_reading();
     void handle_disconnect();
+    void schedule_reconnect();
+
+    enum class State { DISCONNECTED, CONNECTING, CONNECTED };
 
     IoUringLoop& loop_;
     std::string host_;
     int port_;
     std::shared_ptr<TcpConnection> connection_;
 
-    // An atomic bool for thread-safe status checks.
-    std::atomic<bool> is_connected_ = false;
+    std::atomic<State> state_ = State::DISCONNECTED;
 
     ConnectionCallback on_connect_ = [](auto){};
     ConnectionCallback on_disconnect_ = [](auto){};
     MessageCallback on_message_ = [](const auto&){};
     ConnectionFailedCallback on_connect_failed_ = []{};
+
+    const std::chrono::seconds reconnect_delay_{5};
 };
 
 #endif // TCP_CLIENT_HPP

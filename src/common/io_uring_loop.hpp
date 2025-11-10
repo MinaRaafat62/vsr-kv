@@ -26,7 +26,7 @@ public:
 
     void run();
 
-    // NEW: A thread-safe way to post work to the loop.
+    // A thread-safe way to post work to the loop.
     void post(std::function<void()> work);
 
     // These are now intended to be called ONLY from the loop's own thread.
@@ -56,7 +56,6 @@ private:
     io_uring ring_;
     bool is_running_ = true;
 
-    // --- Thread-safety additions ---
     int event_fd_;
     uint64_t event_fd_buffer_ = 0;
     std::mutex work_queue_mutex_;
